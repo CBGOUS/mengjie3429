@@ -1,0 +1,117 @@
+# ---
+# title: "ScopeLoomR_test"
+# output: html_document
+# ---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## load packages
+
+we are using scopeloomR to convert seurat object into loom file as the input for SCENIC.
+
+```{r load packages}
+library('Seurat')
+library('dplyr')
+library('patchwork')
+library('SCopeLoomR')
+```
+
+## Load seurat object
+
+Standard approach for generating seurat object.
+
+```{r load seurat object, echo=FALSE}
+# Create a seurat object
+my_exp_raw=(read.csv("/Users/xuanjiang/data/single_cell_data/input_data/m2-1_RSEC_MolsPerCell_transposed_upper.csv",row.names = 1,stringsAsFactors = F))
+dgem_m2=as.matrix(my_exp_raw)
+dgem_m2<-CreateSeuratObject(counts = dgem_m2, project = "mcmv_m2", min.cells = 3, min.features = 200)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+## Normalization and scaling
+
+```{r Normalization using sctransform, echo=FALSE}
+# Standard RNA data processing
+dgem_m2[["percent.mt"]] <- PercentageFeatureSet(dgem_m2, pattern = "^MT-")
+# This sctransform normalization single command replaces NormalizeData(), ScaleData(), and FindVariableFeatures().
+# Transformed data will be available in the SCT assay, which is set as the default after running sctransform
+# During normalization, we can also remove confounding sources of variation, for example, mitochondrial mapping percentage
+# This normalization is better than lognormalization
+# By default this command returns 3000 features. I thought it would be better to have more to represent more subtle biological fluctuations..
+dgem_m2 <- suppressWarnings(expr = SCTransform(dgem_m2, method = "glmGamPoi", vars.to.regress = "percent.mt",variable.features.n = 5000, verbose = FALSE))
+# After this sctransform, it is always suggested to use higher number of PCs as it has better and more robust results.
+dgem_m2 <- RunPCA(dgem_m2, npcs = 30)
+dgem_m2 <- RunUMAP(dgem_m2, dims = 1:30,
+              reduction.name = "umap.rna", reduction.key = 'rnaUMAP_')
+dgem_m2 <- FindNeighbors(dgem_m2, dims = 1:30)
+dgem_m2 <- FindClusters(dgem_m2, resolution = 0.8, algorithm = 3)
+# sctransform calculates a model of technical noise in scRNA-seq data using ‘regularized negative binomial regression’. The residuals for this model are normalized values, and can be positive or negative. Positive residuals for a given gene in a given cell indicate that we observed more UMIs than expected given the gene’s average expression in the population and cellular sequencing depth, while negative residuals indicate the converse.
+# dgem_m2[["SCT"]]@scale.data contains the residuals (normalized values), and is used directly as input to PCA. The ‘corrected’ UMI counts are stored in dgem_m2[["SCT"]]@counts. We store log-normalized versions of these corrected counts in dgem_m2[["SCT"]]@data, which are very helpful for visualization.
+# In principle, for differential expression and integration, it would be most optimal to perform these calculations directly on the residuals (stored in the scale.data slot) themselves. 
+
+# Find markers under the resolution of 0.8 for clustering.
+markers.0.8 <- FindAllMarkers(dgem_m2,
+                          only.pos = TRUE, min.pct = 0.5, logfc.threshold = 0.5)
+saveRDS(markers.0.8, file = "dgem_m2_seurat_markers_res0.8.rds.gz", compress = "gzip")
+
+# Perform another round of clustering using resolution of 1.0.
+dgem_m2 <- FindClusters(dgem_m2, resolution = 1.0, algorithm = 3)
+markers.1.0 <- FindAllMarkers(dgem_m2,
+                          only.pos = TRUE, min.pct = 0.5, logfc.threshold = 0.5)
+saveRDS(markers.1.0, file = "dgem_m2_seurat_markers_res1.0.rds.gz", compress = "gzip")
+# Now we save the data as rds
+saveRDS(dgem_m2, file = "dgem_m2_seurat_test.rds.gz", compress = "gzip")
+head(Idents(dgem_m2),5)
+```
+
+## Create a loom file
+
+Now we can build the loom according to the files we saved and the metadata associated with them.
+```{r build loom, echo=FALSE}
+markers.0.8 <- readRDS("dgem_m2_seurat_markers_res0.8.rds.gz")
+markers.1.0 <- readRDS("dgem_m2_seurat_markers_res1.0.rds.gz")
+dgem_m2 <- readRDS("dgem_m2_seurat_test.rds.gz")
+build_loom(file.name = "seurat_m2_test.loom",
+           dgem = dgem_m2@assays$RNA@counts,
+           title = "m2_test_loom",
+           default.embedding = dgem_m2@reductions$umap.rna@cell.embeddings,
+           default.embedding.name = "umap.rna")
+```
+
+Now we open the loom file for editing
+```{r open loom}
+# make backup file
+system("cp seurat_m2_test.loom seurat_m2_test.loom_bk")
+# open it for editing
+loom <- open_loom("seurat_m2_test.loom", mode = "r+")
+```
+
+## Add additional embedding and metadata
+```{r add embedding}
+# embedding PCA data
+add_embedding(loom = loom, 
+              embedding = dgem_m2@reductions$pca@cell.embeddings,
+              name = "pca")
+# add column info
+add_col_attr(loom = loom, key = "percent.mito", value = dgem_m2@meta.data$percent.mt, as.metric = TRUE)
+add_col_attr(loom = loom, key = "cluster.id", value = as.character(dgem_m2@meta.data[["SCT_snn_res.0.8"]]), as.annotation = T)
+```
+
+## Add Seurat clusters and markers
+```{r add clusters and markers}
+add_seurat_clustering(loom = loom, seurat = dgem_m2, seurat.assay = "RNA", seurat.clustering.prefix = "SCT_snn_res.",default.clustering.resolution = "res.0.8", seurat.markers.file.path.list = list(SCT_snn_res.0.8 = "dgem_m2_seurat_markers_res0.8.rds.gz", SCT_snn_res.1 = "dgem_m2_seurat_markers_res1.0.rds.gz"),
+        seurat.marker.metric.accessors = c("avg_log2FC", "p_val_adj"),
+        seurat.marker.metric.names = c("Avg. log2FC", "adjusted P-value"),
+        seurat.marker.metric.description =  c("Average log fold change", "Adjusted p-value (BF)"))
+# to check the columns of the metadata
+names(dgem_m2@meta.data)
+```
+
+## Don't forget to close the .loom file
+```{r close the loom}
+close_loom(loom)
+```
+
